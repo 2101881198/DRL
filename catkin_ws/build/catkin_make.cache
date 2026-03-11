@@ -1,0 +1,2 @@
+multi_robot_scenario:velodyne_simulator/velodyne_description:velodyne_simulator/velodyne_gazebo_plugins:velodyne_simulator/velodyne_simulator
+-DCATKIN_DEVEL_PREFIX=/home/cqu/DRL/catkin_ws/devel -DCMAKE_INSTALL_PREFIX=/home/cqu/DRL/catkin_ws/install -G Unix Makefiles
