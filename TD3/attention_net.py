@@ -272,7 +272,7 @@ class TD3(object):
         
         return episode_per_step_action                                                                          # A: [1, 2]                                 
 
-    def train(self, replay_buffer, iterations, discount = 1, 
+    def train(self, replay_buffer, iterations, discount = 0.99, 
                 tau = 0.005, policy_noise = 0.2, noise_clip = 0.5, policy_freq = 2):
         
         #* 在一个episode中多少步，就更新多少次参数                                            
