@@ -36,11 +36,13 @@ def check_pos(x, y):
 
 # 🌟 修复点 1: 稳定的 numpy 降采样
 def binning(data, quantity=20):
-    # data 是一个长数组 (比如 360 或者 512 维的激光雷达)
-    # 将其均匀分割成 20 份，取每一份的最小值
     data = np.array(data)
-    data[np.isinf(data)] = 10.0 # 把无穷大设为最大探测距离 10
-    data[np.isnan(data)] = 10.0
+    data[np.isinf(data)] = 10.0 # 太远测不到，设为10米安全距离
+    data[np.isnan(data)] = 0.0  # 👈 修改这里！太近测不到(报错)，直接判定为0米(撞车)！
+    
+    split_data = np.array_split(data, quantity)
+    bins = [np.min(chunk) for chunk in split_data]
+    return np.array(bins, dtype=np.float32)
     
     # 使用 split 或者简单的 reshaping 来求每个区块的最小距离
     # 为了避免无法整除，使用 array_split
@@ -124,7 +126,7 @@ class GazeboEnv:
                         break
 
     def calculate_observation(self, laser_ranges):
-        min_range = 0.35 # 稍微加大一点碰撞体积，防止擦边没判定
+        min_range = 0.22 # 稍微加大一点碰撞体积，防止擦边没判定
         done = False
         col = False
         min_laser = np.min(laser_ranges)
@@ -199,7 +201,7 @@ class GazeboEnv:
         if min_laser < 0.6:
             reward -= (0.6 - min_laser) * 10 # 越近扣分越狠
 
-        if Dist < 0.35:
+        if Dist < 0.4:
             target = True
             done = True
             reward += 100 # 到达目标给大奖

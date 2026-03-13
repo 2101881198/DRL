@@ -8,7 +8,7 @@ class ReplayBuffer(object):
 
         self.max_size = 1000000
         self.count = 0      # 记录当前已存数据总量
-        self.ptr = 0        # 🌟 新增：环形写入指针 (Write Pointer)
+        self.ptr = 0        # 环形写入指针
         
         self.state_dim = 24
         self.action_dim = 2
@@ -19,10 +19,10 @@ class ReplayBuffer(object):
         self.R_BUF = np.zeros(self.max_size, dtype=np.float32)
         self.DONE_BUF = np.zeros(self.max_size, dtype=np.float32)
         
-        np.random.seed(random_seed) # 统一使用 numpy 随机种子
+        np.random.seed(random_seed) 
 
     def add(self, state, action, reward, done, next_state):
-        # 🌟 O(1) 复杂度的环形插入，拒绝内存大搬运！
+        # O(1) 复杂度的环形插入，拒绝内存大搬运，极速写入！
         self.S_BUF[self.ptr] = state
         self.A_BUF[self.ptr] = action
         self.R_BUF[self.ptr] = reward
@@ -36,18 +36,20 @@ class ReplayBuffer(object):
     def sample_batch(self, batch_size = 16, max_hisLen = 10):
         
         idxs = []
-        # 🌟 1. 安全采样逻辑：确保采样的历史序列不会跨越当前的写入指针（避免新老数据混合）
+        # 安全采样逻辑：确保序列绝对纯洁，不跨越任何断层
         while len(idxs) < batch_size:
             idx = np.random.randint(0, self.count)
+            
+            # 1. 如果池子没满，避开最开头的那几步（防止往回倒推取到末尾的 0）
+            if self.count < self.max_size and idx < max_hisLen - 1:
+                continue
+                
+            # 2. 如果池子满了，避开写入指针所在的新旧数据断层
             if self.count == self.max_size:
-                # 如果池子满了，判断 idx 往回倒推 max_hisLen 步是否会撞上写入指针
                 dist_to_ptr = (idx - self.ptr) % self.max_size
-                if dist_to_ptr < max_hisLen:
-                    continue # 序列不纯洁，丢弃重抽
-            else:
-                # 还没满时，idx 必须大于历史长度
-                if idx < max_hisLen:
-                    continue
+                if dist_to_ptr < max_hisLen - 1:
+                    continue 
+                    
             idxs.append(idx)
             
         idxs = np.array(idxs)
@@ -61,34 +63,36 @@ class ReplayBuffer(object):
         HNSL_BATCH = max_hisLen * np.ones(batch_size, dtype=np.float32)
 
         for i, id in enumerate(idxs):
-            # 🌟 2. 利用取模运算轻松获取环形数组的历史索引
-            seq_idxs = np.arange(id - max_hisLen, id) % self.max_size
             
-            # 寻找序列中是否包含 done 标志
-            dones = self.DONE_BUF[seq_idxs]
+            # 👇 修复核心：序列必须包含 id 本身！长度刚好是 max_hisLen
+            seq_idxs = np.arange(id - max_hisLen + 1, id + 1) % self.max_size
+            
+            # 我们只检查 'id' 之前的步骤是否发生了死亡/截断，不检查 'id' 本身
+            dones = self.DONE_BUF[seq_idxs[:-1]]
             done_locs = np.where(dones == 1)[0]
             
-            # 如果中间有回合结束的标志，我们要进行截断和边缘填充 (Edge Padding)
+            # 如果前面有死亡记录，说明这段历史包含了上一个回合的废数据，需要截断
             if len(done_locs) > 0:
-                # 真正的起点在最后一个 done 的下一个位置
+                # 真正的有效历史起点，在最后一次死亡的下一帧
                 cut_point = done_locs[-1] + 1
                 
-                # 修改有效长度
+                # 记录有效长度
                 his_seg_len = max_hisLen - cut_point
                 HSL_BATCH[i] = his_seg_len
                 HNSL_BATCH[i] = his_seg_len
                 
-                # 边缘填充：把前面的无效位置，全部用 cut_point 的第一个有效状态填充（相当于原地等待）
+                # 边缘填充 (Edge Padding)：把前面无效的废数据，全用第一帧有效数据覆盖
                 seq_idxs[:cut_point] = seq_idxs[cut_point]
+            else:
+                HSL_BATCH[i] = max_hisLen
+                HNSL_BATCH[i] = max_hisLen
 
-            # 🌟 3. 并行切片，抛弃 for 循环和 if/else 填充，速度极致提升！
+            # 并行提取矩阵数据
             HS_BATCH[i] = self.S_BUF[seq_idxs]
             HA_BATCH[i] = self.A_BUF[seq_idxs]
-            
-            # 由于 NS_BUF 严格平齐 S_BUF，直接用同一组索引即可获取完全对应的 Next_State！
             HNS_BATCH[i] = self.NS_BUF[seq_idxs]
             
-            # HNA_BATCH (Next Action) 同样平移即可。用取模避免越界。
+            # Next action 平移取模即可
             next_action_idxs = (seq_idxs + 1) % self.max_size
             HNA_BATCH[i] = self.A_BUF[next_action_idxs]
 

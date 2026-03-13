@@ -242,10 +242,14 @@ class TD3(object):
             h_next_state_len = batch['h_next_state_length'].to(device)            
 
             # 更新 Critic -------------------------------------------------------------
+            # 更新 Critic -------------------------------------------------------------
             with torch.no_grad():
                 next_action = self.actor_target(next_state, h_next_state, h_next_state_len)
-                noise = action.data.normal_(0, policy_noise)
+                
+                # ✅ 资深工程师修正：生成全新的 noise 张量，绝不污染原有的 action！
+                noise = torch.randn_like(action) * policy_noise
                 noise = noise.clamp(-noise_clip, noise_clip)
+                
                 next_action = (next_action + noise).clamp(-self.max_action, self.max_action)
 
                 target_Q1, target_Q2 = self.critic_target(next_state, next_action, h_next_state, 
@@ -253,6 +257,7 @@ class TD3(object):
                 target_Q = torch.min(target_Q1, target_Q2)
                 target_Q = reward + (1 - done) * discount * target_Q
 
+            # 👇 此时的 action 原汁原味，没有任何污染，Critic 终于能正确打分了！
             current_Q1, current_Q2 = self.critic(state, action, h_state, h_action, h_state_len)
 
             critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
