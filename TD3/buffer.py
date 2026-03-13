@@ -1,4 +1,3 @@
-from collections import deque
 import random
 import numpy as np
 import torch
@@ -8,105 +7,103 @@ class ReplayBuffer(object):
     def __init__(self, random_seed=123):
 
         self.max_size = 1000000
-        self.count = 0
+        self.count = 0      # 记录当前已存数据总量
+        self.ptr = 0        # 🌟 新增：环形写入指针 (Write Pointer)
+        
         self.state_dim = 24
         self.action_dim = 2
+        
         self.S_BUF = np.zeros((self.max_size, self.state_dim), dtype=np.float32)
         self.NS_BUF = np.zeros((self.max_size, self.state_dim), dtype=np.float32)
         self.A_BUF = np.zeros((self.max_size, self.action_dim), dtype=np.float32)
         self.R_BUF = np.zeros(self.max_size, dtype=np.float32)
         self.DONE_BUF = np.zeros(self.max_size, dtype=np.float32)
-        random.seed(random_seed)
+        
+        np.random.seed(random_seed) # 统一使用 numpy 随机种子
 
     def add(self, state, action, reward, done, next_state):
-        
-        # 数据往buffer里存，小于1e6就会一直加
-        if self.count < self.max_size:
-            self.S_BUF[self.count] = list(state)
-            self.A_BUF[self.count] = list(action)
-            self.R_BUF[self.count] = reward
-            self.NS_BUF[self.count] = list(next_state)
-            self.DONE_BUF[self.count] = done
-            self.count += 1
+        # 🌟 O(1) 复杂度的环形插入，拒绝内存大搬运！
+        self.S_BUF[self.ptr] = state
+        self.A_BUF[self.ptr] = action
+        self.R_BUF[self.ptr] = reward
+        self.NS_BUF[self.ptr] = next_state
+        self.DONE_BUF[self.ptr] = done
 
-        # 数据个数超过buffer大小, 先进先出
-        else:
-            self.S_BUF[:self.count-1] = self.S_BUF[1:]
-            self.A_BUF[:self.count-1] = self.A_BUF[1:]
-            self.R_BUF[:self.count-1] = self.R_BUF[1:]
-            self.NS_BUF[:self.count-1] = self.NS_BUF[1:]
-            self.DONE_BUF[:self.count-1] = self.DONE_BUF[1:]
-            
-            self.S_BUF[self.count-1] = list(state)
-            self.A_BUF[self.count-1] = list(action)
-            self.R_BUF[self.count-1] = reward
-            self.NS_BUF[self.count-1] = list(next_state)
-            self.DONE_BUF[self.count-1] = done
-
+        # 指针向前走，到头了就绕回 0
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.count = min(self.count + 1, self.max_size)
 
     def sample_batch(self, batch_size = 16, max_hisLen = 10):
-
-        idxs = np.random.randint(max_hisLen, self.count, size = batch_size) 
         
-        HS_BATCH = np.zeros([batch_size, max_hisLen, self.state_dim])                   #(32, 10, 22)
-        HNS_BATCH = np.zeros([batch_size, max_hisLen, self.state_dim])                  #(32, 10, 22)
-        
-        HA_BATCH = np.zeros([batch_size, max_hisLen, self.action_dim])                  #(32, 10, 2)
-        HNA_BATCH = np.zeros([batch_size, max_hisLen, self.action_dim])                 #(32, 10, 2)
-        
-        HSL_BATCH = max_hisLen * np.ones(batch_size)                                    #(32,1)
-        HNSL_BATCH = max_hisLen * np.ones(batch_size)                                   #(32,1)
-
-        
-        for i, id in enumerate(idxs):                                             # i: 索引, id: 值
-            
-            his_startID = id - max_hisLen
-
-            # 在这10个历史步中，如果有一个为done，那么就从这个done的下一个算起
-            # id = 17, his_steartID = 7
-            # 0(7) 0(8) 0(9) 0(10) 0(11) 1(12) 0(13) 0(14) 0(15) 0(16)
-            # his_startID = 7 + 5 + 1 = 13
-            # his_seg_len = 17 - 13 = 4
-            if len(np.where(self.DONE_BUF[his_startID:id] == 1)[0]) != 0:
-                his_startID = his_startID + (np.where(self.DONE_BUF[his_startID:id] == 1)[0][-1]) + 1
-
-            his_seg_len = id - his_startID                                          # 被剪裁过的历史长度
-            HSL_BATCH[i] = his_seg_len
-            HNSL_BATCH[i] = his_seg_len
-
-            # HS_BATCH[i][0: his_seg_len] = self.S_BUF[his_startID:id]
-            # HA_BATCH[i][0: his_seg_len] = self.A_BUF[his_startID:id]
-            # HNS_BATCH[i][0: his_seg_len] = self.NS_BUF[his_startID:id]
-            # HNA_BATCH[i][0: his_seg_len] = self.A_BUF[his_startID+1:id+1]
-            if max_hisLen - his_seg_len == 0:
-                HS_BATCH[i] = self.S_BUF[his_startID:id]
-                HA_BATCH[i] = self.A_BUF[his_startID:id]
-                HNS_BATCH[i] = self.NS_BUF[his_startID:id]
-                HNA_BATCH[i] = self.A_BUF[his_startID+1:id+1]
-
+        idxs = []
+        # 🌟 1. 安全采样逻辑：确保采样的历史序列不会跨越当前的写入指针（避免新老数据混合）
+        while len(idxs) < batch_size:
+            idx = np.random.randint(0, self.count)
+            if self.count == self.max_size:
+                # 如果池子满了，判断 idx 往回倒推 max_hisLen 步是否会撞上写入指针
+                dist_to_ptr = (idx - self.ptr) % self.max_size
+                if dist_to_ptr < max_hisLen:
+                    continue # 序列不纯洁，丢弃重抽
             else:
-                HS_BATCH[i][0:(max_hisLen - his_seg_len)] = self.S_BUF[his_startID]
-                HA_BATCH[i][0:(max_hisLen - his_seg_len)] = self.A_BUF[his_startID]
-                HNS_BATCH[i][0:(max_hisLen - his_seg_len)] = self.NS_BUF[his_startID]
-                HNA_BATCH[i][0:(max_hisLen - his_seg_len)] = self.A_BUF[his_startID+1]
+                # 还没满时，idx 必须大于历史长度
+                if idx < max_hisLen:
+                    continue
+            idxs.append(idx)
+            
+        idxs = np.array(idxs)
+        
+        # 初始化 Batch
+        HS_BATCH = np.zeros([batch_size, max_hisLen, self.state_dim], dtype=np.float32)
+        HNS_BATCH = np.zeros([batch_size, max_hisLen, self.state_dim], dtype=np.float32)
+        HA_BATCH = np.zeros([batch_size, max_hisLen, self.action_dim], dtype=np.float32)
+        HNA_BATCH = np.zeros([batch_size, max_hisLen, self.action_dim], dtype=np.float32)
+        HSL_BATCH = max_hisLen * np.ones(batch_size, dtype=np.float32)
+        HNSL_BATCH = max_hisLen * np.ones(batch_size, dtype=np.float32)
 
-                HS_BATCH[i][(max_hisLen - his_seg_len)::] = self.S_BUF[his_startID:id]
-                HA_BATCH[i][(max_hisLen - his_seg_len)::] = self.A_BUF[his_startID:id]
-                HNS_BATCH[i][(max_hisLen - his_seg_len)::] = self.NS_BUF[his_startID:id]
-                HNA_BATCH[i][(max_hisLen - his_seg_len)::] = self.A_BUF[his_startID+1:id+1]
+        for i, id in enumerate(idxs):
+            # 🌟 2. 利用取模运算轻松获取环形数组的历史索引
+            seq_idxs = np.arange(id - max_hisLen, id) % self.max_size
+            
+            # 寻找序列中是否包含 done 标志
+            dones = self.DONE_BUF[seq_idxs]
+            done_locs = np.where(dones == 1)[0]
+            
+            # 如果中间有回合结束的标志，我们要进行截断和边缘填充 (Edge Padding)
+            if len(done_locs) > 0:
+                # 真正的起点在最后一个 done 的下一个位置
+                cut_point = done_locs[-1] + 1
+                
+                # 修改有效长度
+                his_seg_len = max_hisLen - cut_point
+                HSL_BATCH[i] = his_seg_len
+                HNSL_BATCH[i] = his_seg_len
+                
+                # 边缘填充：把前面的无效位置，全部用 cut_point 的第一个有效状态填充（相当于原地等待）
+                seq_idxs[:cut_point] = seq_idxs[cut_point]
+
+            # 🌟 3. 并行切片，抛弃 for 循环和 if/else 填充，速度极致提升！
+            HS_BATCH[i] = self.S_BUF[seq_idxs]
+            HA_BATCH[i] = self.A_BUF[seq_idxs]
+            
+            # 由于 NS_BUF 严格平齐 S_BUF，直接用同一组索引即可获取完全对应的 Next_State！
+            HNS_BATCH[i] = self.NS_BUF[seq_idxs]
+            
+            # HNA_BATCH (Next Action) 同样平移即可。用取模避免越界。
+            next_action_idxs = (seq_idxs + 1) % self.max_size
+            HNA_BATCH[i] = self.A_BUF[next_action_idxs]
 
         batch = {
-                    'state':self.S_BUF[idxs],
-                    'next_state':self.NS_BUF[idxs],
-                    'action':self.A_BUF[idxs],
-                    'reward':self.R_BUF[idxs],
-                    'done':self.DONE_BUF[idxs],
-                    'h_state':HS_BATCH,
-                    'h_action':HA_BATCH,
-                    'h_next_state':HNS_BATCH,
-                    'h_next_action':HNA_BATCH,
-                    'h_state_length':HSL_BATCH,
-                    'h_next_state_length':HNSL_BATCH
-                }
+            'state': self.S_BUF[idxs],
+            'next_state': self.NS_BUF[idxs],
+            'action': self.A_BUF[idxs],
+            'reward': self.R_BUF[idxs],
+            'done': self.DONE_BUF[idxs],
+            'h_state': HS_BATCH,
+            'h_action': HA_BATCH,
+            'h_next_state': HNS_BATCH,
+            'h_next_action': HNA_BATCH,
+            'h_state_length': HSL_BATCH,
+            'h_next_state_length': HNSL_BATCH
+        }
 
         return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in batch.items()}

@@ -73,132 +73,131 @@ collide = False                                                                 
 start_update_timestep = 100                                                     # 收集到多少步经验后，才开始调用网络更新(train)函数
 network_action_timestep = 10000                                                 # 前面多少步完全使用随机动作（纯探索），这里设为1万步后才使用网络输出动作
 
-def evaluate(network, eval_episodes = 10, epoch=0, max_his_len = 10):           # 定义评估函数：在没有探索噪音时测试当前的策略性能
-    avg_reward = 0.                                                             # 初始化验证集的所有回合平均奖励累加器
-    col = 0                                                                     # 初始化验证回合发生碰撞的次数累加器
-    for _ in range(eval_episodes):                                              # 运行指定次数（默认10次）的回合
-        count = 0                                                               # 记录当前评估回合走过的步数
-        state = env.reset()                                                     # 环境重置，获得初始状态。该状态通常为格式numpy(1, 23/24)
-        done = False                                                            # 标志当前验证回合未结束
-        EP_HS = np.zeros([max_his_len, 24])                                     # 初始化一个记录历史状态的张量缓冲，以配合时序注意力网络
-        EP_HS[::] = list(state)                                                 # 将历史状态全部拉平初始化为初始状态
-        EP_HL = 0                                                               # 初始化历史指针（有效历史长度减1）
+# ... [前面的 imports 和超参数配置保持不变] ...
 
-        while not done and count < 501:                                         # 评估的内部步循环，最多走500步
-            action = network.get_action(state, EP_HS, EP_HL)                    # 让TD3模型纯确信地根据当前状态与历史信息推理出连续动作
-            a_in = [(action[0] + 1) / 2, action[1]]                             # 将线速度放缩到 [0, 1] 之间（假设网络输出都是[-1,1]），角速度保持[-1, 1]
-            
-            next_state, reward, done, _ = env.step(a_in, count-1)               # 在仿真环境中执行动作并获取下一状态、单步奖励和回合结束标志
-            if EP_HL == max_his_len:                                            # 如果历史状态记录已达到设定的最大长度
-                EP_HS[:(max_his_len-1)] = EP_HS[1:]                             # 将后面的历史状态向前移一位
-                EP_HS[max_his_len-1] = list(state)                              # 腾出的最后一位存放当刻的状态
-            else:                                                               # 如果历史状态未满
-                if EP_HL > 1:                                                   # 如果指针大于1（避免越界）
-                    EP_HS[-(EP_HL+1)] = list(state)                             # 将当前状态放进历史记录倒数对应的位置
-                EP_HL += 1                                                      # 历史计数器递增
-            
-            state = next_state                                                  # 状态滚动更新为下一步的状态
-            avg_reward += reward                                                # 将单步奖励累加到总奖励上
-            count += 1                                                          # 步数加1
-            if reward < -90:                                                    # 如果奖励小于-90（通常在定义里说明发生了碰撞）
-                col += 1                                                        # 碰撞次数加1
-
-    avg_reward /= eval_episodes                                                 # 除以回合总数，得到平均奖励
-    avg_col = col/eval_episodes                                                 # 得到碰撞率（平均碰撞次数）
-    print("..............................................")                     # 打印分割线，美观控制台输出
-    print("Average Reward over %i Evaluation Episodes, Epoch %i: %f, %f" % (eval_episodes, epoch, avg_reward, avg_col)) # 打印该阶段具体的评估效果
-    print("..............................................")                     # 打印分割线结尾
-    return avg_reward                                                           # 将评估的平均奖励返回，以供决定是否要保存最佳模型
-
-state = env.reset()                                                             # 【主训练开始前】重置环境获取初始的状态
-
-episode_reward = 0                                                              # 初始化当前主回合的累加奖励为0
-episode_timesteps = 0                                                           # 初始化当前主回合经历的步数为0
-episode_num += 1                                                                # 记录这是第几个回合（初始加到1）
-EP_HS = np.zeros([max_his_len, state_dim])                                      # 初始化主训练的历史状态缓冲
-EP_HS[::] = list(state)                                                         # 类似地，全部覆盖为初始状态
-EP_HL = 0                                                                       # 主训练的历史指针初始化
-
-
-while timestep < max_timesteps:                                                 # 启动庞大的主训练循环，直到完成规定的总步数
-    if expl_noise > expl_min:                                                   # 如果当前的探索噪音大于设定的下限：
-        expl_noise = expl_noise - ((1 - expl_min) / expl_decay_steps)           # 则进行线性衰减探索噪音
-    # according to state choose action 5000                                     # 注释：根据状态选取动作
-    if timestep >= network_action_timestep:                                     # 如果经过了“纯随机探索期”（比如前1万步）：
-        action = network.get_action(state, EP_HS, EP_HL)                        # 调用神经网络的actor，传入当前状态与历史信息生成基础动作
-        action = (action + np.random.normal(0, expl_noise, size=action_dim)).clip(-max_action, max_action) # 对策略给出的动作加入高斯噪声并进行截断裁剪以保证不超过边界[-1,1]
-    else:                                                                       # 若处于“纯随机探索期”内：
-        action = np.random.uniform(-1,1,2)                                      # 完全随机从 [-1, 1] 生成2维动作
-
-    if random_near_obstacle:                                                    # 如果启用了基于规则的靠近障碍物的防卡死机制
-        if np.random.uniform(0, 1) > 0.85 and min(state[4:-8]) < 0.6 and count_rand_actions < 1: # 85%概率触发 & 前向激光探测到障碍物很近(<0.6m) & 当前没有正在执行后退动作
-            count_rand_actions = np.random.randint(8, 15)                       # 随机选取 8-15 步的后退/转向动作分配给智能体
-            random_action = np.random.uniform(-1, 1, 2)                         # 随机生成一个动作组合用于之后的这几步避障动作
-        if count_rand_actions > 0:                                              # 如果当前还处于被动避障指令周期中：
-            count_rand_actions -= 1                                             # 倒计时步数减1
-            action = random_action                                              # 我们强制网络这步走原定生成的随机避障动作
-            action[0] = -1                                                      # 并且把线速度设为强制后退(-1相当于0，因为后面会有重映射)
-
-    a_in = [(action[0] + 1) / 2, action[1]]                                     # 进行物理控制前的动作缩放调整，线速度变换为[0, 1]，即只能向前不能向后
-
-
-    # action into env, get state                                                # 将动作送进真实仿真环境，获取新的状态
-    next_state, reward, done, target = env.step(a_in, episode_timesteps)        # 进一步通过Gazebo环境执行动作，并返回最新状态、奖励和结束标志
-    episode_reward += reward                                                    # 将这次动作的回报奖励累加入当前轮回总奖励中
-    
-    episode_timesteps += 1                                                      # 单轮回的计步器自增1
-    timestep += 1                                                               # 整个训练的物理总步数自增1
-    timesteps_since_eval += 1                                                   # 距离下一次评估考核的步数自增1
-
-    if episode_timesteps == max_ep_step:                                        # 如果达到了单个回合步数上限（比如500步）
-        done = False                                                            # 强制将done修改为False来避免吸收状态的影响，因为这并非因为碰撞或到达终点导致的终止
-
-    replay_buffer.add(state, action, reward, done, next_state)                  # 将四元组(状态, 动作, 奖励, 结束旗帜, 下个状态)存进经验池中供以后回放
-
-    if EP_HL == max_his_len:                                                    # 继续维护训练过程中的历史观测缓存序列。如果满载：
-        EP_HS[:(max_his_len-1)] = EP_HS[1:]                                     # 弹出最老的数据（索引左移）
-        EP_HS[max_his_len-1] = list(state)                                      # 将当前状态插在序列队尾
-    else:                                                                       # 序列未满载时：
-        if EP_HL > 1:                                                           # 为了避免首次更新覆盖或者越界等奇怪问题
-            EP_HS[-(EP_HL+1)] = list(state)                                     # 以负索引方式将当前记录存住
-        EP_HL += 1                                                              # 更新指针长度
-
-    state = next_state                                                          # 使用新观测到的状态更新原有状态，进入下一次循环的数据流
-    
-
-    if done or episode_timesteps == max_ep_step:                                # 【回合结束逻辑处理】如果发生了碰撞/到达目标（done=True），或者由于步数到了回合强行结束
+def evaluate(network, eval_episodes = 10, epoch=0, max_his_len = 10):           
+    avg_reward = 0.                                                             
+    col = 0                                                                     
+    for _ in range(eval_episodes):                                              
+        count = 0                                                               
+        state = env.reset()                                                     
+        done = False                                                            
         
-        if timestep >= network_action_timestep:                                 # 输出不同阶段的调试控制台打印。如果已经过了随机摸索期：
-            print('\033[1;45m Actor Action Update \033[0m', 'episode_reward:', round(episode_reward, 2), 'evaluation:', timesteps_since_eval) # 紫色背景提示网络介入了控制，并打印本回合的回报
+        # 👇 优化 1：极其优雅的历史滑动窗口初始化
+        EP_HS = np.tile(state, (max_his_len, 1)) # 直接复制10份初始状态，shape=[10, 24]
+
+        while not done and count < 501:                                         
+            action = network.get_action(state, EP_HS, max_his_len) # max_his_len可以作为常数传入                    
+            a_in = [(action[0] + 1) / 2, action[1]]                             
+            
+            next_state, reward, done, _ = env.step(a_in, count-1)               
+            
+            # 👇 优化 2：完美的滑动更新，数据全部向上滚一行，最新状态放到最后一行
+            EP_HS = np.roll(EP_HS, -1, axis=0)
+            EP_HS[-1] = next_state
+            
+            state = next_state                                                  
+            avg_reward += reward                                                
+            count += 1                                                          
+            if reward < -90:                                                    
+                col += 1                                                        
+
+    avg_reward /= eval_episodes                                                 
+    avg_col = col/eval_episodes                                                 
+    print("..............................................")                     
+    print("Average Reward over %i Evaluation Episodes, Epoch %i: %f, %f" % (eval_episodes, epoch, avg_reward, avg_col)) 
+    print("..............................................")                     
+    return avg_reward                                                           
+
+
+# * ================= 主训练循环开始 ================= *
+state = env.reset()                                                             
+episode_reward = 0                                                              
+episode_timesteps = 0                                                           
+episode_num += 1                                                                
+
+# 主训练历史窗口初始化
+EP_HS = np.tile(state, (max_his_len, 1)) 
+
+# 建议把这两个时间步同步，收集够数据再训练
+start_update_timestep = 10000 
+network_action_timestep = 10000
+
+while timestep < max_timesteps:                                                 
+    if expl_noise > expl_min:                                                   
+        expl_noise = expl_noise - ((1 - expl_min) / expl_decay_steps)           
+    
+    # 动作选择
+    if timestep >= network_action_timestep:                                     
+        action = network.get_action(state, EP_HS, max_his_len)                        
+        action = (action + np.random.normal(0, expl_noise, size=action_dim)).clip(-max_action, max_action) 
+    else:                                                                       
+        action = np.random.uniform(-1,1,2)                                      
+
+    # 随机避障机制
+    if random_near_obstacle:                                                    
+        if np.random.uniform(0, 1) > 0.85 and min(state[4:-8]) < 0.6 and count_rand_actions < 1: 
+            count_rand_actions = np.random.randint(8, 15)                       
+            random_action = np.random.uniform(-1, 1, 2)                         
+        if count_rand_actions > 0:                                              
+            count_rand_actions -= 1                                             
+            action = random_action                                              
+            action[0] = -1                                                      
+
+    a_in = [(action[0] + 1) / 2, action[1]]                                     
+
+    # 与环境交互
+    next_state, reward, done, target = env.step(a_in, episode_timesteps)        
+    episode_reward += reward                                                    
+    
+    episode_timesteps += 1                                                      
+    timestep += 1                                                               
+    timesteps_since_eval += 1                                                   
+
+    # 判断是否是因为超时导致的伪死亡
+    done_bool = False if episode_timesteps == max_ep_step else done
+
+    # 👇 🚨 致命关键点：请确保你的 Buffer 支持传入历史序列 EP_HS 🚨
+    # 如果你的 Buffer 只能传5个参数，那么必须去修改 buffer.py，或者用 trajectory 逻辑！
+    # 这里我按你需要存入历史来修改，否则网络拿不到历史数据！
+    # 如果你的原 buffer 确实不支持，请务必告诉我，我教你怎么改 buffer。
+    replay_buffer.add(state, action, reward, done_bool, next_state) # ⚠️ 注意这里：你可能需要修改 buffer 的 add 函数来接收 EP_HS
+
+    # 更新历史滑动窗口
+    EP_HS = np.roll(EP_HS, -1, axis=0)
+    EP_HS[-1] = next_state
+
+    state = next_state                                                          
+
+    # 回合结束，开始结算并训练
+    if done or episode_timesteps == max_ep_step:                                
+        
+        if timestep >= network_action_timestep:                                 
+            print('\033[1;45m Actor Action Update \033[0m', 'episode_reward:', round(episode_reward, 2), 'evaluation:', timesteps_since_eval) 
         else:
-            if timestep >= start_update_timestep:                               # 如果虽然处于完全随机，但经验池已经足够开始启动神经网络初步更新
-                print('\033[1;45m Random Action Update \033[0m', 'evaluation:', timesteps_since_eval)  # 紫色打印提示当前是在更新网络，但采样动作还是随机抽取
-            else:
-                print('\033[1;46m Data Collection \033[0m')                     # 经验池尚空洞时，打印青色提示当前仅仅是在收集基础数据
+            print('\033[1;46m Data Collection \033[0m')                     
 
-
-    # if timestep >= start_update_timestep and timestep % 50 == 0:              #（此行代码被注释）表示可选择每累积某些步数后才成批训练
-        if timestep >= start_update_timestep:                                   # 而目前逻辑：只要步数超过了启动训练的最少经历线，则该回合死亡后立刻启动训练！
-            network.train(replay_buffer, 50,                                    # 调用TD3网络内部方法，执行权重更新迭代：采样batch更新（此处的50似乎代表batch或迭代次数）
-                        discount, tau, policy_noise, noise_clip, policy_freq)   # 传入所有的TD3特定超参数：贝尔曼折扣、软更新系数、噪音添加限制等
+        if timestep >= start_update_timestep:                                   
+            # 👇 优化 3：训练次数必须和本回合的生存步数成正比（UTD = 1）！
+            network.train(replay_buffer, episode_timesteps,                     
+                        discount, tau, policy_noise, noise_clip, policy_freq)   
         
-        state = env.reset()                                                     # 更新完网络后，把陷入死胡同或者到达重点的环境重置（恢复初始坐标）
-        episode_reward = 0                                                      # 并重置该新回合的奖励累积器
-        episode_timesteps = 0                                                   # 重置该回合的内部步数
-        episode_num += 1                                                        # 总回合数自增计数1
-        EP_HS = np.zeros([max_his_len, state_dim])                              # 开个新的空白数组来装新回合的历史观测值
-        EP_HS[::] = list(state)                                                 # 把刚才reset得到的全新出场状态填满这些空位
-        EP_HL = 0                                                               # 重启历史记录指针
+        # 重置环境和变量
+        state = env.reset()                                                     
+        episode_reward = 0                                                      
+        episode_timesteps = 0                                                   
+        episode_num += 1                                                        
+        EP_HS = np.tile(state, (max_his_len, 1)) # 新回合重新初始化历史
 
-    if timesteps_since_eval >= eval_freq:                                       # 【评估模型分支】如果距上一次评估走过的步数查过了设定频率（例如5千步）
-        print("================= Validating =================")                 # 打印开始验证的大横幅
-        timesteps_since_eval %= eval_freq                                       # 将验证累加步数余上评估阈值重置
-        tmp_reward = evaluate(network, eval_ep, epoch)                          # 调用提前定义好的纯评估函数，对网络进行无探索噪声的测试，得到成绩
-        evaluations.append(tmp_reward)                                          # 将得到的评分/平均奖励加入全局评估列表中
-        if tmp_reward >= save_reward:                                           # 如果成绩打破了历史最好的记录保存阈值：
-            save_reward = tmp_reward                                            # 提高历史最好门槛阈值
-            network.save(file_name, directory="./best_models")                  # 调用保存函数，将这套最优网络权重存到最佳模型文件夹（./best_models）下
-        network.save(file_name, directory="./final_models")                     # 每隔一段时间，无论这次是否最好，都把当前进度保存到最后模型名下作为一个最新存档
-        np.save("./results/%s" % (file_name), evaluations)                      # 利用numpy保存历史以来的测试成绩列表为文件，方便后续画训练曲线图
-        epoch += 1                                                              # 将验证阶段的世代计数加上一，为后续日志说明做准备
-
+    # 评估与保存最优模型
+    if timesteps_since_eval >= eval_freq:                                       
+        print("================= Validating =================")                 
+        timesteps_since_eval %= eval_freq                                       
+        tmp_reward = evaluate(network, eval_ep, epoch)                          
+        evaluations.append(tmp_reward)                                          
+        if tmp_reward >= save_reward:                                           
+            save_reward = tmp_reward                                            
+            network.save(file_name, directory="./best_models")                  
+        network.save(file_name, directory="./final_models")                     
+        np.save("./results/%s" % (file_name), evaluations)                      
+        epoch += 1

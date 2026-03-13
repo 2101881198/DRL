@@ -11,51 +11,44 @@ class Actor(nn.Module):
         super(Actor, self).__init__()
         self.cat_len = 128
         
-        # 👇 修改点 1: 替换为高效的 MLP 雷达特征提取器
+        # 优化点: 最后一层去掉 ReLU，保留连续特征空间
         self.lidar_dim = state_dim - 4 if state_dim > 4 else state_dim
         self.lidar_encoder = nn.Sequential(
             nn.Linear(self.lidar_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, self.lidar_dim),
-            nn.ReLU()
+            nn.Linear(64, self.lidar_dim) 
         ).to(device)
 
-        # 历史state
-        self.HFC1 = nn.ModuleList()
-        self.LSTM = nn.ModuleList()
-        self.HFC2 = nn.ModuleList()
-        self.HFC1 += [nn.Linear(state_dim, 256), nn.ReLU()]
-        self.LSTM += [nn.GRU(256, 256, batch_first=True)]
+        # 历史特征处理
+        self.HFC1 = nn.Sequential(nn.Linear(state_dim, 256), nn.ReLU())
+        self.LSTM = nn.GRU(256, 256, batch_first=True)
 
-        self.w_omega = nn.Parameter(torch.Tensor(256, 256))
-        self.u_omega = nn.Parameter(torch.Tensor(256, 1))
-        nn.init.uniform_(self.w_omega, -0.1, 0.1)
-        nn.init.uniform_(self.u_omega, -0.1, 0.1)
+        # 优化点: 改进的 Attention 参数 (Query, Key, Value)
+        # 用当前特征(Query)去查历史特征(Key)
+        self.W_q = nn.Linear(3 * self.cat_len, 256) # 当前特征维度 -> 256
+        self.W_k = nn.Linear(256, 256)              # 历史特征维度 -> 256
+        self.W_v = nn.Linear(256, 256)              # 历史特征维度 -> 256
+        self.scale = torch.sqrt(torch.FloatTensor([256])).to(device)
 
-        self.HFC2 += [nn.Linear(256, self.cat_len), nn.ReLU(), nn.Dropout()]
+        self.HFC2 = nn.Sequential(nn.Linear(256, self.cat_len), nn.ReLU(), nn.Dropout())
 
-        # 当前state
-        self.CFC = nn.ModuleList()
-        self.FinalFC = nn.ModuleList()
-        self.CFC += [nn.Linear(state_dim, 3*self.cat_len), nn.ReLU(), nn.Dropout()]
-        self.FinalFC += [nn.Linear(4*self.cat_len, 2), nn.Tanh()]
+        # 当前特征处理
+        self.CFC = nn.Sequential(nn.Linear(state_dim, 3*self.cat_len), nn.ReLU(), nn.Dropout())
+        
+        # 最终输出层
+        self.FinalFC = nn.Sequential(nn.Linear(4*self.cat_len, 2), nn.Tanh())
 
     def process_state(self, state):
-        # state can be [batch, dim] or [batch, seq_len, dim]
         is_seq = state.dim() == 3
         if is_seq:
             B, L, D = state.size()
             state = state.view(B * L, D)
         
-        # Split into lidar and robot state
         if state.size(1) > 4:
-            # 👇 修改点 2: 不再需要 unsqueeze 强行加维度，直接喂给 MLP
-            lidar = state[:, :-4]              # [N, lidar_dim]
-            robot = state[:, -4:]              # [N, 4]
-            
-            lidar_feat = self.lidar_encoder(lidar) # [N, lidar_dim]
-            
-            full_feat = torch.cat([lidar_feat, robot], dim=1) # [N, dim]
+            lidar = state[:, :-4]              
+            robot = state[:, -4:]              
+            lidar_feat = self.lidar_encoder(lidar) 
+            full_feat = torch.cat([lidar_feat, robot], dim=1) 
         else:
             full_feat = state
 
@@ -66,34 +59,34 @@ class Actor(nn.Module):
 
     def forward(self, state, his_state, his_len):
         
-        # Preprocess with Encoder
         state = self.process_state(state)
         his_state = self.process_state(his_state)
 
-        # 历史数据
-        his_input = his_state                                                       # [1, 10, 22]                                               
-        for layer in self.HFC1: his_input = layer(his_input)                        # [1, 10, 256]
-        for layer in self.LSTM: his_input, _ = layer(his_input)                     # [1, 10, 256]
+        # 1. 处理当前数据 (先提出来，作为 Attention 的 Query)
+        cur_output = self.CFC(state) # [B, 384]
+
+        # 2. 处理历史数据
+        his_input = self.HFC1(his_state)                        
+        his_out_lstm, _ = self.LSTM(his_input) # [B, Seq, 256]
         
-        # 开始attention
-        x = his_input
-        u = torch.tanh(torch.matmul(x, self.w_omega))                               # [1, 10, 256]
-        att = torch.matmul(u, self.u_omega)                                         # [1, 10, 1]
-        att_score = F.softmax(att, dim=1)                                           # [1, 10, 1]
-        scored_x = x * att_score                                                    # [1, 10, 256]
-        feat = torch.sum(scored_x, dim=1)                                           # [1, 256]
-        for layer in self.HFC2: feat = layer(feat)                                  # [1, 128]                            
-        his_output = feat
+        # 3. 改进的 Attention (Scaled Dot-Product)
+        # Query: 当前状态特征; Key/Value: LSTM输出的历史特征
+        Q = self.W_q(cur_output).unsqueeze(1)  # [B, 1, 256]
+        K = self.W_k(his_out_lstm)             # [B, Seq, 256]
+        V = self.W_v(his_out_lstm)             # [B, Seq, 256]
 
-        # 当前数据
-        cur_input = state                                                           
-        for layer in self.CFC: cur_input = layer(cur_input)                          # [1, 384]                               
-        cur_output = cur_input
+        # 计算权重: (Q * K^T) / sqrt(d_k)
+        att_scores = torch.bmm(Q, K.transpose(1, 2)) / self.scale # [B, 1, Seq]
+        att_weights = F.softmax(att_scores, dim=-1)               # [B, 1, Seq]
+        
+        # 融合特征: Weights * Value
+        att_out = torch.bmm(att_weights, V).squeeze(1)            # [B, 256]
+        
+        his_output = self.HFC2(att_out)                           # [B, 128]
 
-        # 合并历史和当前数据
-        final_input = torch.cat([his_output, cur_output], dim = -1)                  # [1, 512]
-        for layer in self.FinalFC: final_input = layer(final_input)                  # [1, 2]   
-        action = final_input
+        # 4. 合并历史和当前数据
+        final_input = torch.cat([his_output, cur_output], dim = -1)  # [B, 512]
+        action = self.FinalFC(final_input)                           # [B, 2]   
         
         return action
 
@@ -103,76 +96,49 @@ class Critic(nn.Module):
         super(Critic, self).__init__()
         self.cat_len = 128
         
-        # 👇 修改点 3: Critic 里也做同样的 MLP 替换
         self.lidar_dim = state_dim - 4 if state_dim > 4 else state_dim
         self.lidar_encoder = nn.Sequential(
             nn.Linear(self.lidar_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, self.lidar_dim),
-            nn.ReLU()
+            nn.Linear(64, self.lidar_dim)
         ).to(device)
 
-        # 历史数据: state
-        self.HS1 = nn.ModuleList()
-        self.HS_LSTM = nn.ModuleList()
-        self.HS2 = nn.ModuleList()
-        self.HS1 += [nn.Linear(state_dim, 256), nn.ReLU()]
-        self.HS_LSTM += [nn.GRU(256, 256, batch_first=True)]
+        # Q1 网络结构 ====================================================
+        self.HS1 = nn.Sequential(nn.Linear(state_dim, 256), nn.ReLU())
+        self.HS_LSTM = nn.GRU(256, 256, batch_first=True)
         
-        self.w_omega = nn.Parameter(torch.Tensor(256, 256))
-        self.u_omega = nn.Parameter(torch.Tensor(256, 1))
-        nn.init.uniform_(self.w_omega, -0.1, 0.1)
-        nn.init.uniform_(self.u_omega, -0.1, 0.1)
+        self.W_q1 = nn.Linear(3 * self.cat_len, 256)
+        self.W_k1 = nn.Linear(256, 256)
+        self.W_v1 = nn.Linear(256, 256)
+        self.scale = torch.sqrt(torch.FloatTensor([256])).to(device)
 
-        self.HS2 += [nn.Linear(256, self.cat_len), nn.ReLU()]
+        self.HS2 = nn.Sequential(nn.Linear(256, self.cat_len), nn.ReLU())
+        self.SA1 = nn.Sequential(nn.Linear(state_dim + action_dim, 3*self.cat_len), nn.ReLU())
+        self.Final1 = nn.Sequential(nn.Linear(4*self.cat_len, 64), nn.ReLU(), nn.Linear(64 , 1))
 
-        # 当前数据: state
-        self.SA = nn.ModuleList()
-        self.SA += [nn.Linear(state_dim + action_dim, 3*self.cat_len), nn.ReLU()]
-
-        # 最后
-        self.Final = nn.ModuleList()
-        self.Final += [nn.Linear(4*self.cat_len, 64),nn.ReLU(), nn.Linear(64 , 1), nn.Identity()]
-
-        # =================================================================
-        # 历史数据: state
-        self._HS1 = nn.ModuleList()
-        self._HS_LSTM = nn.ModuleList()
-        self._HS2 = nn.ModuleList()
-        self._HS1 += [nn.Linear(state_dim, 256), nn.ReLU()]
-        self._HS_LSTM += [nn.GRU(256, 256, batch_first=True)]
+        # Q2 网络结构 ====================================================
+        self._HS1 = nn.Sequential(nn.Linear(state_dim, 256), nn.ReLU())
+        self._HS_LSTM = nn.GRU(256, 256, batch_first=True)
         
-        self._w_omega = nn.Parameter(torch.Tensor(256, 256))
-        self._u_omega = nn.Parameter(torch.Tensor(256, 1))
-        nn.init.uniform_(self._w_omega, -0.1, 0.1)
-        nn.init.uniform_(self._u_omega, -0.1, 0.1)
+        self.W_q2 = nn.Linear(3 * self.cat_len, 256)
+        self.W_k2 = nn.Linear(256, 256)
+        self.W_v2 = nn.Linear(256, 256)
 
-        self._HS2 += [nn.Linear(256, self.cat_len), nn.ReLU()]
-
-        # 当前数据: state
-        self._SA = nn.ModuleList()
-        self._SA += [nn.Linear(state_dim + action_dim, 3*self.cat_len), nn.ReLU()]
-
-        # 最后
-        self._Final = nn.ModuleList()
-        self._Final += [nn.Linear(4*self.cat_len, 64),nn.ReLU(), nn.Linear(64, 1), nn.Identity()]
+        self._HS2 = nn.Sequential(nn.Linear(256, self.cat_len), nn.ReLU())
+        self._SA2 = nn.Sequential(nn.Linear(state_dim + action_dim, 3*self.cat_len), nn.ReLU())
+        self._Final2 = nn.Sequential(nn.Linear(4*self.cat_len, 64), nn.ReLU(), nn.Linear(64, 1))
 
     def process_state(self, state):
-        # state can be [batch, dim] or [batch, seq_len, dim]
         is_seq = state.dim() == 3
         if is_seq:
             B, L, D = state.size()
             state = state.view(B * L, D)
         
-        # Split into lidar and robot state
         if state.size(1) > 4:
-            # 👇 修改点 4: 处理逻辑和 Actor 保持一致
-            lidar = state[:, :-4]              # [N, lidar_dim]
-            robot = state[:, -4:]              # [N, 4]
-            
-            lidar_feat = self.lidar_encoder(lidar) # [N, lidar_dim]
-            
-            full_feat = torch.cat([lidar_feat, robot], dim=1) # [N, dim]
+            lidar = state[:, :-4]              
+            robot = state[:, -4:]              
+            lidar_feat = self.lidar_encoder(lidar) 
+            full_feat = torch.cat([lidar_feat, robot], dim=1) 
         else:
             full_feat = state
 
@@ -183,61 +149,43 @@ class Critic(nn.Module):
 
     def forward(self, state, action, his_state, his_action, his_len):
         
-        # Preprocess with Encoder
         state = self.process_state(state)
         his_state = self.process_state(his_state)
 
-        # 历史数据
-        hs = his_state
-        _hs = his_state
-        for layer in self.HS1: hs = layer(hs)
-        for layer in self._HS1: _hs = layer(_hs)
-        for layer in self.HS_LSTM: hs, _ = layer(hs)
-        for layer in self._HS_LSTM: _hs, _ = layer(_hs)
-
-        # 开始 attention
-        x = hs
-        _x = _hs
-        u = torch.tanh(torch.matmul(x, self.w_omega))
-        _u = torch.tanh(torch.matmul(_x, self._w_omega))
-
-        att = torch.matmul(u, self.u_omega)
-        _att = torch.matmul(_u, self._u_omega)
-
-        att_score = F.softmax(att, dim=1)
-        _att_score = F.softmax(_att, dim=1)
-
-        scored_x = x * att_score
-        _scored_x = _x * _att_score
-
-        feat = torch.sum(scored_x, dim=1) 
-        _feat = torch.sum(_scored_x, dim=1)     
-
-        for layer in self.HS2: feat = layer(feat)
-        for layer in self._HS2: _feat = layer(_feat)
-        hist_out = feat
-        _hist_out = _feat
-        
-        # current state action
+        # 提取当前的 state-action 联合特征 (用作 Query)
         sa = torch.cat([state, action], dim = -1)
-        _sa = torch.cat([state, action], dim = -1)
-
-        for layer in self.SA: sa = layer(sa)
-        for layer in self._SA: _sa = layer(_sa)
-
-        cur_out = sa
-        _cur_out = _sa
-
-        # final
-        final = torch.cat([hist_out, cur_out], dim = -1)
-        _final = torch.cat([_hist_out, _cur_out], dim = -1)
-
-        for layer in self.Final: final = layer(final)
-        for layer in self._Final: _final = layer(_final)
-
-        q1 = torch.squeeze(final, -1)
-        q2 = torch.squeeze(_final, -1)
         
+        cur_out1 = self.SA1(sa)
+        cur_out2 = self._SA2(sa)
+
+        # =========== 计算 Q1 的历史特征 ===========
+        hs1 = self.HS1(his_state)
+        hs_lstm1, _ = self.HS_LSTM(hs1)
+
+        Q1 = self.W_q1(cur_out1).unsqueeze(1)
+        K1 = self.W_k1(hs_lstm1)
+        V1 = self.W_v1(hs_lstm1)
+        att_scores1 = torch.bmm(Q1, K1.transpose(1, 2)) / self.scale
+        att_out1 = torch.bmm(F.softmax(att_scores1, dim=-1), V1).squeeze(1)
+        hist_out1 = self.HS2(att_out1)
+
+        # =========== 计算 Q2 的历史特征 ===========
+        hs2 = self._HS1(his_state)
+        hs_lstm2, _ = self._HS_LSTM(hs2)
+
+        Q2 = self.W_q2(cur_out2).unsqueeze(1)
+        K2 = self.W_k2(hs_lstm2)
+        V2 = self.W_v2(hs_lstm2)
+        att_scores2 = torch.bmm(Q2, K2.transpose(1, 2)) / self.scale
+        att_out2 = torch.bmm(F.softmax(att_scores2, dim=-1), V2).squeeze(1)
+        hist_out2 = self._HS2(att_out2)
+        
+        # =========== 融合并输出 Q1, Q2 ===========
+        final1 = torch.cat([hist_out1, cur_out1], dim = -1)
+        final2 = torch.cat([hist_out2, cur_out2], dim = -1)
+
+        q1 = self.Final1(final1).squeeze(-1)
+        q2 = self._Final2(final2).squeeze(-1)
 
         return q1, q2
 
@@ -246,29 +194,24 @@ class TD3(object):
     
     def __init__(self, state_dim=24, action_dim=2):
         
-        # actor, actor_target初始化
         self.actor = Actor(state_dim).to(device)
         self.actor_target = Actor(state_dim).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters())
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4) # 建议显式设定 LR
 
-        # critic, critic_target初始化
         self.critic = Critic(state_dim, action_dim).to(device)
         self.critic_target = Critic(state_dim, action_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters())
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4) # Critic 的 LR 通常稍大
 
         self.max_action = 1
 
-    # 这个函数只会在A过程(episode的每一步)中调用
     def get_action(self, state, his_state, his_len):
-        # 切换到测试模式 (关键！解决 BatchNorm 报错和 Dropout 干扰)
         self.actor.eval() 
         
         his_state = torch.Tensor(his_state).view(1, his_state.shape[0], his_state.shape[1]).float().to(device)
         his_len = torch.Tensor([his_len]).float().to(device)
         
-        # 关闭梯度计算 (关键！极其节省显存，加快速度)
         with torch.no_grad():
             episode_per_step_action = self.actor(
                 torch.as_tensor(state, dtype=torch.float32).view(1, -1).to(device), 
@@ -276,18 +219,15 @@ class TD3(object):
                 his_len
             ).cpu().data.numpy().flatten()
             
-        # 恢复训练模式，以免影响后面的 train() 更新参数
         self.actor.train()
         
-        return episode_per_step_action                                                                    # A: [1, 2]                                 
+        return episode_per_step_action                                                                   
 
-    def train(self, replay_buffer, iterations, discount = 0.99  , 
+    def train(self, replay_buffer, iterations, discount = 0.99, 
                 tau = 0.005, policy_noise = 0.2, noise_clip = 0.5, policy_freq = 2):
         
-        #* 在一个episode中多少步，就更新多少次参数                                              
         for it in range(iterations):
             
-            # 从 replay buffer 里面选数据
             batch = replay_buffer.sample_batch()
             state = batch['state'].to(device)
             next_state = batch['next_state'].to(device)
@@ -301,40 +241,46 @@ class TD3(object):
             h_state_len = batch['h_state_length'].to(device)
             h_next_state_len = batch['h_next_state_length'].to(device)            
 
+            # 更新 Critic -------------------------------------------------------------
+            with torch.no_grad():
+                next_action = self.actor_target(next_state, h_next_state, h_next_state_len)
+                noise = action.data.normal_(0, policy_noise)
+                noise = noise.clamp(-noise_clip, noise_clip)
+                next_action = (next_action + noise).clamp(-self.max_action, self.max_action)
+
+                target_Q1, target_Q2 = self.critic_target(next_state, next_action, h_next_state, 
+                                                            h_next_action, h_next_state_len)
+                target_Q = torch.min(target_Q1, target_Q2)
+                target_Q = reward + (1 - done) * discount * target_Q
+
             current_Q1, current_Q2 = self.critic(state, action, h_state, h_action, h_state_len)
 
-            #* 从target_actor中获取下一个动作
-            next_action = self.actor_target(next_state, h_next_state, h_next_state_len)
-            noise = action.data.normal_(0, policy_noise)
-            noise = noise.clamp(-noise_clip, noise_clip)
-            next_action = (next_action + noise).clamp(-self.max_action, self.max_action)
-
-            #* 从target_critic中得到target_Q值
-            target_Q1, target_Q2 = self.critic_target(next_state, next_action, h_next_state, 
-                                                        h_next_action, h_next_state_len)
-            target_Q = torch.min(target_Q1, target_Q2)
-            target_Q = reward + ((1 - done) * discount * target_Q).detach()
-
-            #* 从critic中得到Q1, Q2
             critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
-            #! critic 参数更新
             self.critic_optimizer.zero_grad()
-            # print('critic_loss:', critic_loss.item()[0])
             critic_loss.backward()
             self.critic_optimizer.step()
 
-            #! actor 参数更新
+            # 延迟更新 Actor ----------------------------------------------------------
             if it % policy_freq == 0:
 
-                actor_loss, _ = self.critic(state, self.actor(state, h_state, h_state_len), 
-                            h_state, h_action, h_state_len)
+                # 注意：计算 Actor Loss 时，只用 Q1 即可，并且冻结 Critic 参数以加速
+                for params in self.critic.parameters():
+                    params.requires_grad = False
 
+                actor_action = self.actor(state, h_state, h_state_len)
+                actor_loss, _ = self.critic(state, actor_action, h_state, h_action, h_state_len)
                 actor_loss = -actor_loss.mean()
+
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 self.actor_optimizer.step()
 
+                # 恢复 Critic 参数的梯度
+                for params in self.critic.parameters():
+                    params.requires_grad = True
+
+                # 软更新目标网络
                 for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                         target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
