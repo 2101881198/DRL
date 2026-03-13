@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import *
-from mobilenet_v3_1d import MobileNetV3_1D
-
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -13,9 +11,14 @@ class Actor(nn.Module):
         super(Actor, self).__init__()
         self.cat_len = 128
         
-        # MobileNet Feature Extractor
+        # 👇 修改点 1: 替换为高效的 MLP 雷达特征提取器
         self.lidar_dim = state_dim - 4 if state_dim > 4 else state_dim
-        self.mobilenet = MobileNetV3_1D(n_in_channels=1, output_dim=self.lidar_dim).to(device)
+        self.lidar_encoder = nn.Sequential(
+            nn.Linear(self.lidar_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.lidar_dim),
+            nn.ReLU()
+        ).to(device)
 
         # 历史state
         self.HFC1 = nn.ModuleList()
@@ -46,10 +49,11 @@ class Actor(nn.Module):
         
         # Split into lidar and robot state
         if state.size(1) > 4:
-            lidar = state[:, :-4].unsqueeze(1) # [N, 1, lidar_dim]
+            # 👇 修改点 2: 不再需要 unsqueeze 强行加维度，直接喂给 MLP
+            lidar = state[:, :-4]              # [N, lidar_dim]
             robot = state[:, -4:]              # [N, 4]
             
-            lidar_feat = self.mobilenet(lidar) # [N, lidar_dim]
+            lidar_feat = self.lidar_encoder(lidar) # [N, lidar_dim]
             
             full_feat = torch.cat([lidar_feat, robot], dim=1) # [N, dim]
         else:
@@ -62,12 +66,12 @@ class Actor(nn.Module):
 
     def forward(self, state, his_state, his_len):
         
-        # Preprocess with MobileNet
+        # Preprocess with Encoder
         state = self.process_state(state)
         his_state = self.process_state(his_state)
 
         # 历史数据
-        his_input = his_state                                                       # [1, 10, 22]                                                
+        his_input = his_state                                                       # [1, 10, 22]                                               
         for layer in self.HFC1: his_input = layer(his_input)                        # [1, 10, 256]
         for layer in self.LSTM: his_input, _ = layer(his_input)                     # [1, 10, 256]
         
@@ -82,8 +86,8 @@ class Actor(nn.Module):
         his_output = feat
 
         # 当前数据
-        cur_input = state                                                            
-        for layer in self.CFC: cur_input = layer(cur_input)                          # [1, 384]                              
+        cur_input = state                                                           
+        for layer in self.CFC: cur_input = layer(cur_input)                          # [1, 384]                               
         cur_output = cur_input
 
         # 合并历史和当前数据
@@ -99,9 +103,14 @@ class Critic(nn.Module):
         super(Critic, self).__init__()
         self.cat_len = 128
         
-        # MobileNet Feature Extractor
+        # 👇 修改点 3: Critic 里也做同样的 MLP 替换
         self.lidar_dim = state_dim - 4 if state_dim > 4 else state_dim
-        self.mobilenet = MobileNetV3_1D(n_in_channels=1, output_dim=self.lidar_dim).to(device)
+        self.lidar_encoder = nn.Sequential(
+            nn.Linear(self.lidar_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.lidar_dim),
+            nn.ReLU()
+        ).to(device)
 
         # 历史数据: state
         self.HS1 = nn.ModuleList()
@@ -157,10 +166,11 @@ class Critic(nn.Module):
         
         # Split into lidar and robot state
         if state.size(1) > 4:
-            lidar = state[:, :-4].unsqueeze(1) # [N, 1, lidar_dim]
+            # 👇 修改点 4: 处理逻辑和 Actor 保持一致
+            lidar = state[:, :-4]              # [N, lidar_dim]
             robot = state[:, -4:]              # [N, 4]
             
-            lidar_feat = self.mobilenet(lidar) # [N, lidar_dim]
+            lidar_feat = self.lidar_encoder(lidar) # [N, lidar_dim]
             
             full_feat = torch.cat([lidar_feat, robot], dim=1) # [N, dim]
         else:
@@ -173,7 +183,7 @@ class Critic(nn.Module):
 
     def forward(self, state, action, his_state, his_action, his_len):
         
-        # Preprocess with MobileNet
+        # Preprocess with Encoder
         state = self.process_state(state)
         his_state = self.process_state(his_state)
 
@@ -251,15 +261,14 @@ class TD3(object):
         self.max_action = 1
 
     # 这个函数只会在A过程(episode的每一步)中调用
-    # 这个函数只会在A过程(episode的每一步)中调用
     def get_action(self, state, his_state, his_len):
-        # 👇 1. 切换到测试模式 (关键！解决 BatchNorm 报错和 Dropout 干扰)
+        # 切换到测试模式 (关键！解决 BatchNorm 报错和 Dropout 干扰)
         self.actor.eval() 
         
         his_state = torch.Tensor(his_state).view(1, his_state.shape[0], his_state.shape[1]).float().to(device)
         his_len = torch.Tensor([his_len]).float().to(device)
         
-        # 👇 2. 关闭梯度计算 (关键！极其节省显存，加快速度)
+        # 关闭梯度计算 (关键！极其节省显存，加快速度)
         with torch.no_grad():
             episode_per_step_action = self.actor(
                 torch.as_tensor(state, dtype=torch.float32).view(1, -1).to(device), 
@@ -267,15 +276,15 @@ class TD3(object):
                 his_len
             ).cpu().data.numpy().flatten()
             
-        # 👇 3. 恢复训练模式，以免影响后面的 train() 更新参数
+        # 恢复训练模式，以免影响后面的 train() 更新参数
         self.actor.train()
         
-        return episode_per_step_action                                                                          # A: [1, 2]                                 
+        return episode_per_step_action                                                                    # A: [1, 2]                                 
 
-    def train(self, replay_buffer, iterations, discount = 0.99, 
+    def train(self, replay_buffer, iterations, discount = 0.99  , 
                 tau = 0.005, policy_noise = 0.2, noise_clip = 0.5, policy_freq = 2):
         
-        #* 在一个episode中多少步，就更新多少次参数                                            
+        #* 在一个episode中多少步，就更新多少次参数                                              
         for it in range(iterations):
             
             # 从 replay buffer 里面选数据
